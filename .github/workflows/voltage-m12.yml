@@ -1,0 +1,155 @@
+name: VoltageOS M12 DSU build
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voltage-m12.yml'
+permissions:
+  contents: read
+concurrency:
+  group: voltage-m12-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs android-sdk-libsparse-utils openssl pigz
+          git clone --depth 1 https://android.googlesource.com/platform/external/avb avb
+          git -C avb rev-parse HEAD
+      - name: Download and normalize original GSI
+        run: |
+          set -euo pipefail
+          mkdir -p work output
+          curl --fail --location --retry 3 --output work/source.bin 'https://github.com/xiiabaka-boop/Yty/releases/download/v0.1-beta/Voltage-A16_treble_arm64_bgN.bin'
+          file work/source.bin
+          sha256sum work/source.bin
+          python3 - <<'PY'
+          import pathlib, subprocess, gzip, lzma, shutil, zipfile
+          src = pathlib.Path("work/source.bin")
+          dst = pathlib.Path("work/decoded.img")
+          with src.open("rb") as f:
+              magic = f.read(8)
+          if magic.startswith(b"\x1f\x8b"):
+              with gzip.open(src,"rb") as i, dst.open("wb") as o: shutil.copyfileobj(i,o)
+          elif magic.startswith(b"\xfd7zXZ\x00"):
+              with lzma.open(src,"rb") as i, dst.open("wb") as o: shutil.copyfileobj(i,o)
+          elif zipfile.is_zipfile(src):
+              with zipfile.ZipFile(src) as z:
+                  names = [n for n in z.namelist() if not n.endswith("/") and n.lower().endswith((".img",".bin"))]
+                  if len(names) != 1: raise RuntimeError("Ambiguous image in ZIP")
+                  with z.open(names[0]) as i, dst.open("wb") as o: shutil.copyfileobj(i,o)
+          else:
+              src.rename(dst)
+          with dst.open("rb") as f:
+              sparse = f.read(4) == b"\x3a\xff\x26\xed"
+          if sparse:
+              subprocess.run(["simg2img", str(dst), "work/system.img"], check=True)
+              dst.unlink()
+          else:
+              dst.rename("work/system.img")
+          PY
+          rm -f work/source.bin
+          file work/system.img
+      - name: Validate original image and key
+        run: |
+          set -euo pipefail
+          python3 avb/avbtool.py info_image --image work/system.img | tee output/original-avb.txt
+          grep -F 'cdbb77177f731920bbe0a0f94f84d9038ae0617d' output/original-avb.txt
+          grep -F 'SHA256_RSA2048' output/original-avb.txt
+          grep -F '3194613760 bytes' output/original-avb.txt
+          grep -F '1749081600' output/original-avb.txt
+          grep -F '5920cf6e7e9541ba1ce2af985059ed66052e4c0eb920d38b482edd36ccb77f43' output/original-avb.txt
+          test "$(stat -c %s work/system.img)" = 3245920256
+          python3 avb/avbtool.py extract_public_key --key avb/test/data/testkey_rsa2048.pem --output work/key.avbpubkey
+          echo 'cdbb77177f731920bbe0a0f94f84d9038ae0617d  work/key.avbpubkey' | sha1sum -c -
+          python3 avb/avbtool.py verify_image --image work/system.img --key avb/test/data/testkey_rsa2048.pem
+          python3 avb/avbtool.py erase_footer --image work/system.img
+          test "$(stat -c %s work/system.img)" = 3194613760
+          sudo e2fsck -fn work/system.img
+      - name: Apply experimental M12 compatibility patches
+        run: |
+          set -euo pipefail
+          mkdir -p work/mnt
+          sudo mount -t ext4 -o loop,rw work/system.img work/mnt
+          trap 'sudo umount work/mnt' EXIT
+          sudo python3 - <<'PY'
+          import json, pathlib, re, os, difflib
+          root = pathlib.Path("work/mnt/system")
+          cg = root / "etc/cgroups.json"
+          init = root / "etc/init/hw/init.rc"
+          def update(p, new):
+              old = p.read_text()
+              before = p.stat()
+              attrs = {k: os.getxattr(p,k) for k in os.listxattr(p)}
+              with p.open("w") as f:
+                  f.write(new)
+                  f.flush()
+                  os.fsync(f.fileno())
+              after = p.stat()
+              assert (before.st_ino,before.st_mode,before.st_uid,before.st_gid) == (after.st_ino,after.st_mode,after.st_uid,after.st_gid)
+              assert attrs == {k: os.getxattr(p,k) for k in os.listxattr(p)}
+              print("".join(difflib.unified_diff(old.splitlines(True),new.splitlines(True),fromfile=str(p),tofile=str(p)+".patched")))
+          data = json.loads(cg.read_text())
+          v1 = data["Cgroups"]
+          v2 = data["Cgroups2"]["Controllers"]
+          assert not any(x["Controller"] in ("cpuacct","memory") for x in v1)
+          assert sum(x["Controller"]=="memory" for x in v2)==1
+          v1.extend([
+              {"Controller":"cpuacct","Path":"/acct","Mode":"0555","UID":"root","GID":"root"},
+              {"Controller":"memory","Path":"/dev/memcg","Mode":"0700","UID":"root","GID":"system","Optional":True}
+          ])
+          data["Cgroups2"]["Controllers"] = [x for x in v2 if x["Controller"]!="memory"]
+          update(cg, json.dumps(data,indent=2)+"\n")
+          old = init.read_text()
+          assert "/dev/cpuset/dexopt" not in old
+          matches = list(re.finditer(r"(?m)^([ \t]+)mkdir /dev/cpuset/foreground(?:[ \t].*)?$", old))
+          assert len(matches)==1, "Unexpected init.rc layout"
+          m = matches[0]
+          commands = [
+              "mkdir /dev/cpuset/dexopt 0755 system system",
+              "copy /dev/cpuset/mems /dev/cpuset/dexopt/mems",
+              "copy /dev/cpuset/cpus /dev/cpuset/dexopt/cpus",
+              "chown system system /dev/cpuset/dexopt/cpus",
+              "chown system system /dev/cpuset/dexopt/tasks",
+              "chmod 0664 /dev/cpuset/dexopt/cpus",
+              "chmod 0664 /dev/cpuset/dexopt/tasks",
+          ]
+          patch = "".join(m.group(1)+c+"\n" for c in commands)
+          update(init, old[:m.start()]+patch+old[m.start():])
+          PY
+          sync
+          sudo umount work/mnt
+          trap - EXIT
+          sudo e2fsck -fn work/system.img
+      - name: Rebuild signed AVB hashtree and verify
+        run: |
+          set -euo pipefail
+          python3 avb/avbtool.py add_hashtree_footer \
+            --image work/system.img --partition_name system --partition_size 3245920256 \
+            --algorithm SHA256_RSA2048 --key avb/test/data/testkey_rsa2048.pem \
+            --hash_algorithm sha256 --block_size 4096 --do_not_generate_fec \
+            --rollback_index 1749081600 --salt 9cfdb7754dd78ba5b8adb6f0c43a191b2fdd0dfb22f0cc407be8cb5c62081688 \
+            --prop 'com.android.build.system.os_version:16' \
+            --prop 'com.android.build.system.fingerprint:google/voltage_gsi/tdgsi_arm64_ab:16/BP2A.250605.031.A2/eng.androi:userdebug/release-keys' \
+            --prop 'com.android.build.system.security_patch:2025-06-05'
+          python3 avb/avbtool.py info_image --image work/system.img | tee output/patched-avb.txt
+          python3 avb/avbtool.py verify_image --image work/system.img --key avb/test/data/testkey_rsa2048.pem
+          test "$(stat -c %s work/system.img)" = 3245920256
+          sudo e2fsck -fn work/system.img
+          mv work/system.img work/Voltage-M12-v0.2-alpha.img
+          (cd work && sha256sum Voltage-M12-v0.2-alpha.img) > output/SHA256-image.txt
+          pigz -1 -c work/Voltage-M12-v0.2-alpha.img > output/Voltage-M12-v0.2-alpha.img.gz
+          (cd output && sha256sum Voltage-M12-v0.2-alpha.img.gz > SHA256-gzip.txt)
+          printf '%s\n' 'Experimental DSU image for SM-M127F. Boot untested. AVB test key; FEC omitted, SHA256 hashtree retained. Do not flash permanent partitions.' > output/README.txt
+      - name: Upload validated experimental image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Voltage-M12-v0.2-alpha
+          path: output/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
